@@ -1,0 +1,687 @@
+#!/usr/bin/env perl
+#
+# Solr 8.* munin graph plugin
+# Project repo: https://github.com/nicomen/munin-solr
+#
+# Plugin configuration parameters:
+#
+# [solr_*]
+#    env.SOLR_URL <default http://localhost:8983/solr>
+#    env.solr_qpshandler_<handlerlabel> <handlerpath>
+#    env.solr_qpshandler_<handlerlabel>_usealias <1|0 default 0>
+#
+# Example:
+# [solr_*]
+#    env.SOLR_URL http://solrhost:8080/solr
+#    env.solr_qpshandler_select /select
+#
+# Install plugins:
+#    ln -s /usr/share/munin/plugins/solr_ /etc/munin/plugins/solr_numdocs_core_1
+#    ln -s /usr/share/munin/plugins/solr_ /etc/munin/plugins/solr_requesttimes_select
+#    ln -s /usr/share/munin/plugins/solr_ /etc/munin/plugins/solr_qps
+#    ln -s /usr/share/munin/plugins/solr_ /etc/munin/plugins/solr_qps_core_1_select
+#    ln -s /usr/share/munin/plugins/solr_ /etc/munin/plugins/solr_indexsize
+#    ln -s /usr/share/munin/plugins/solr_ /etc/munin/plugins/solr_memory
+#
+#
+
+use strict;
+use warnings;
+
+use feature 'say';
+use Mojo::UserAgent ();
+use File::Basename qw/basename/;
+
+sub _format {
+  my ($tmpl, $vars) = @_;
+
+  $tmpl =~ s/\{([^{}]+)\}/$vars->{$1}/msiegx;
+
+  return $tmpl;
+}
+
+sub rsplit {
+  my ($pattern, $string, $max) = @_;
+
+  $string = join '', reverse split /($pattern)/, $string;
+
+  return split /$pattern/, $max;
+}
+
+sub float {
+  return shift()+0;
+}
+
+sub int {
+  return int(shift);
+}
+
+my $URIS = {
+    'CORES' =>  "admin/cores?action=STATUS&wt=json",
+    'CORE_MBEAN' =>  "admin/mbeans?stats=true&wt=json",
+    'CORE_SYSTEM' => "admin/system?stats=true&wt=json",
+    'CORE_SELECT' => "admin/metrics?group=core&prefix=QUERY./select",
+};
+
+# core alias support, added to handle core names with dot
+sub load_alias {
+  my ($cores_alias) = @_;
+  return {} unless $cores_alias;
+  return { map { split /:/, $_ } @{ split / /, $cores_alias }};
+}
+
+my $CORE_ALIAS = load_alias($ENV{'solr_cores_alias'});
+
+sub core_alias {
+  my ($core_alias) = @_;
+
+  return [ map { $CORE_ALIAS->{$_} // $_ } @{ $core_alias || [] } ] if ref $core_alias eq 'ARRAY';
+  return $CORE_ALIAS->{$core_alias} // $core_alias;
+}
+
+sub parse_bool {
+  my ($text) = @_;
+  return $text && ($text !~ /^[f0]/);
+}
+
+sub parse_params {
+  my $basename = basename($0);
+  my (undef, $type, $core) = split m{_}, $basename, 3;
+
+  my $params = {
+    'type' => $type,
+    'op' => ((($ARGV[0] // '') eq 'config') ? 'config' : 'fetch'),
+    'core' => $core // '',
+    'params' => {}
+  };
+
+  if ($type =~ /^(qps|requesttimes)$/) {
+    my @data = rsplit($params->{'core'}, '_', 2);
+    my $handler = pop @data;
+    my $usealias = parse_bool($ENV{"solr4_qpshandler_${handler}_usealias"} // 'f'),
+    my $handlername = $ENV{"solr4_qpshandler_$handler"} // 'standard';
+    $params->{'params'} = {
+      'handler' => $handlername,
+      'handleralias' => ($usealias ? $handler : $handlername),
+    };
+    $params->{'core'} = $data[0] // '';
+  } elsif ($type eq  'indexsize') {
+    $params->{'params'}->{'core'} = $params->{'core'}
+  }
+  return $params;
+}
+
+#############################################################################
+# Datasources
+
+sub readPath {
+  my ($struct, $path, $convert, $default) = @_;
+  $default //= -1;
+
+  return $default unless exists $struct->{ $path->[0] } && defined $struct->{ $path->[0] };
+
+  my $obj = $struct->{ $path->[0] };
+
+  my @path = @{ $path };
+  for my $k (@path[1..$#path]) {
+    $obj = ref $obj eq 'HASH'  ? $obj->{$k}
+         : ref $obj eq 'ARRAY' ? $obj->[$k]
+         :                       undef;
+    if (!defined $obj) {
+      $obj = $default;
+      last;
+    }
+  }
+
+  $obj = $convert->($obj) if $convert;
+
+  return $obj;
+}
+
+sub HTTPGetJson {
+   my ($url) = @_;
+
+   my $ua = Mojo::UserAgent->new();
+   my $tx = $ua->build_tx(GET => $url);
+  $tx->req->headers->remove('Accept-Encoding');
+  $tx = $ua->start($tx);
+
+  return $tx->res->json;
+}
+
+package SolrCoresAdmin {
+  use Moo;
+  
+  *HTTPGetJson = \&main::HTTPGetJson;
+  *readPath    = \&main::readPath;
+
+  has solrurl => is => 'lazy';
+  has data => is => 'lazy', default => sub { shift->_fetchCores };
+
+  sub _fetchCores {
+    my ($self) = @_;
+      my $uri = join '/', $self->solrurl, $URIS->{'CORES'};
+      return HTTPGetJson($uri);
+  }
+
+  sub getCores {
+    my ($self) = @_;
+    my $cores = readPath($self->data, ['status']);
+    return [ keys %{ ref $cores ? $cores : {} } ];
+  }
+
+  sub indexsize {
+    my ($self, $opt) = @_;
+    my $result = {};
+    my $core = $opt->{core};
+    if ($core) {
+      $result->{$core} = readPath($self->data, ['status', $core, 'index', 'sizeInBytes']);
+    } else {
+      for my $core (@{ $self->getCores() || [] }) {
+        $result->{$core} = readPath($self->data, ['status', $core, 'index', 'sizeInBytes']);
+      }
+    }
+    return $result;
+  }
+
+};
+
+package SolrCoreMBean {
+  
+  use Data::Dumper;
+  use Moo;
+
+  *HTTPGetJson = \&main::HTTPGetJson;
+  *readPath    = \&main::readPath;
+  *int         = \&main::int;
+  *float       = \&main::float;
+  
+  has core => is => 'lazy';
+  has solrurl => is => 'lazy';
+  has data => is => 'lazy', default => sub {
+    my $self = shift; 
+    {
+      'solr-mbeans' => $self->_fetchMBeans(),
+      'system'      => $self->_fetchSystem(),
+    };
+  };
+
+  sub _fetchMBeans {
+    my ($self) = @_;
+    my $uri = join '/', ($self->solrurl, $self->core, $URIS->{'CORE_MBEAN'});
+    my $raw_data = HTTPGetJson($uri);
+
+    my $hashref = { @{ $raw_data->{'solr-mbeans'} } };
+    
+    return $hashref;
+  }
+
+  sub _fetchSystem {
+    my ($self) = @_;
+    my $uri = join '/', ($self->solrurl, $self->core, $URIS->{'CORE_SYSTEM'});
+    return HTTPGetJson($uri);
+  }
+
+  sub _readInt {
+    my ($self, $path) = @_;
+    return $self->_read($path, \&int);
+  }
+
+  sub _readFloat {
+    my ($self, $path) = @_;
+    return $self->_read($path, \&float);
+  }
+
+  sub _read {
+    my ($self, $path, $convert) = @_;
+
+    return readPath($self->data, $path, $convert);
+  }
+
+  sub _readCache {
+    my ($self, $cache) = @_;
+    my $result = {};
+    while (my ($key, $ftype) = each %{ { ('lookups', \&int), ('hits', \&int), ('inserts', \&int), ('evictions', \&int), ('hitratio', \&float) } } ) {
+      my $path = ['solr-mbeans', 'CACHE', $cache, 'stats', "cumulative_$key"];
+      $result->{$key} = $self->_read($path, $ftype);
+      $result->{'size'} = $self->_readInt(['solr-mbeans', 'CACHE', $cache, 'stats', 'size']);
+    }
+    return $result;
+  }
+
+  sub getCore {
+    return shift->core;
+  }
+
+  sub requestcount {
+    my ($self, $handler) = @_;
+    my $path = ['solr-mbeans', 'QUERYHANDLER', $handler, 'stats', 'requests'];
+    return $self->_readInt($path);
+  }
+
+  sub requesttimeouts {
+    my ($self, $handler) = @_;
+        my $path = ['solr-mbeans', 'QUERYHANDLER', $handler, 'stats', 'timeouts'];
+        return $self->_readInt($path);
+  }
+
+  sub requesterrors {
+    my ($self, $handler) = @_;
+        my $path = ['solr-mbeans', 'QUERYHANDLER', $handler, 'stats', 'errors'];
+        return $self->_readInt($path);
+  }
+
+  sub qps {
+    my ($self, $handler) = @_;
+    my $path = ['solr-mbeans', 'QUERYHANDLER', $handler, 'stats', 'avgRequestsPerSecond'];
+    return $self->_readFloat($path);
+  }
+
+  sub requesttimes {
+    my ($self, $handler) = @_;
+    my $times = {};
+    my $path = ['select', 'metrics', $handler, 'stats'];
+    for my $perc ('avgTimePerRequest', '75thPcRequestTime', '99thPcRequestTime') {
+        $times->{$perc} = $self->_read([ @{ $path }, $perc ], \&float);
+    }
+    return $times;
+  }
+
+  sub numdocs {
+    my ($self) = @_;
+    my $path = ['solr-mbeans', 'CORE', 'searcher', 'stats', 'SEARCHER.searcher.numDocs'];
+    return $self->_readInt($path);
+  }
+  sub documentcache {
+    my ($self) = @_;
+    return $self->_readCache('documentCache');
+  }
+  sub filtercache {
+    my ($self) = @_;
+    return $self->_readCache('filterCache');
+  }
+  sub fieldvaluecache {
+    my ($self) = @_;
+    return $self->_readCache('fieldValueCache');
+  }
+  sub queryresultcache {
+    my ($self) = @_;
+    return $self->_readCache('queryResultCache');
+  }
+  sub memory {
+    my ($self) = @_;
+    my $data = $self->_read(['system', 'jvm', 'memory', 'raw']);
+
+    delete $data->{'used%'};
+
+    for my $k (keys %{$data || {} }) {
+      $data->{$k} = int($data->{$k});
+      return $data;
+    }
+  }
+}
+
+#############################################################################
+# Graph Templates
+
+my $CACHE_GRAPH_TPL = 'multigraph solr_{core}_{cacheType}_hit_rates
+graph_category solr
+graph_title Solr {core} {cacheName} Hit rates
+graph_order lookups hits inserts
+graph_scale no
+graph_vlabel Hit Rate
+graph_args -u 100 --rigid
+lookups.label Cache lookups
+lookups.graph no
+lookups.min 0
+lookups.type DERIVE
+inserts.label Cache misses
+inserts.min 0
+inserts.draw STACK
+inserts.csub inserts,lookups,/,100,*
+inserts.type DERIVE
+hits.label Cache hits
+hits.min 0
+hits.draw AREA
+hits.csub hits,lookups,/,100,*
+hits.type DERIVE
+
+multigraph solr_{core}_{cacheType}_size
+graph_title Solr {core} {cacheName} Size
+graph_args -l 0
+graph_category solr
+graph_vlabel Size
+size.label Size
+size.draw AREA
+evictions.label Evictions/s
+evictions.draw LINE2
+evictions.type DERIVE
+';
+
+my $QPSMAIN_GRAPH_TPL = 'graph_title Solr {core} {handler} Request per second
+graph_args --base 1000 -r --lower-limit 0
+graph_scale no
+graph_vlabel request / second
+graph_category solr
+graph_period second
+graph_order {gorder}
+{cores_qps_graphs}
+';
+
+my $QPSCORE_GRAPH_TPL = 'qps_{core}_{handler}.label {core_label} Request
+qps_{core}_{handler}.draw {gtype}
+qps_{core}_{handler}.type GAUGE
+qps_{core}_{handler}.colour 008000
+qps_{core}_{handler}.min 0
+qps_{core}_{handler}.graph yes
+timeouts_{core}_{handler}.label {core_label} Timeout
+timeouts_{core}_{handler}.draw {gtype}
+timeouts_{core}_{handler}.type GAUGE
+timeouts_{core}_{handler}.colour FFA500
+timeouts_{core}_{handler}.min 0
+timeouts_{core}_{handler}.graph yes
+errors_{core}_{handler}.label {core_label} Error
+errors_{core}_{handler}.draw {gtype}
+errors_{core}_{handler}.type GAUGE
+errors_{core}_{handler}.colour FF0000
+errors_{core}_{handler}.min 0
+errors_{core}_{handler}.graph yes';
+
+my $REQUESTTIMES_GRAPH_TPL = 'multigraph solr_requesttimes_{core}_{handler}
+graph_title Solr {core} {handler} Time per request
+graph_args -l 0
+graph_vlabel millis
+graph_category solr
+smean_ms_{core}.label Avg time per request
+smean_ms_{core}.type GAUGE
+smean_ms_{core}.graph yes
+sp75_ms_{core}.label 75th perc
+sp75_ms_{core}.type GAUGE
+sp75_ms_{core}.graph yes
+sp95_ms_{core}.label 99th perc
+sp95_ms_{core}.type GAUGE
+sp95_ms_{core}.graph yes
+';
+
+my $NUMDOCS_GRAPH_TPL = 'graph_title Solr Docs %s
+graph_vlabel docs
+docs.label Docs
+graph_category solr';
+
+my $INDEXSIZE_GRAPH_TPL = 'graph_args --base 1024 -l 0 
+graph_vlabel Bytes
+graph_title Index Size
+graph_category solr
+graph_info Solr Index Size.
+graph_order {cores}
+{cores_config}
+xmx.label Xmx
+xmx.colour ff0000
+';
+
+my $INDEXSIZECORE_GRAPH_TPL = '{core}.label {core}
+{core}.draw STACK'; 
+
+my $MEMORYUSAGE_GRAPH_TPL = 'graph_args --base 1024 -l 0 --upper-limit {availableram}
+graph_vlabel Bytes
+graph_title Solr memory usage
+graph_category solr
+graph_info Solr Memory Usage.
+used.label Used
+max.label Max
+max.colour ff0000
+';
+
+#############################################################################
+# Graph managment
+
+package SolrMuninGraph {
+
+  use Moo;
+
+  *_format = \&main::_format;
+  *core_alias = \&main::core_alias;
+  *HTTPGetJson = \&main::HTTPGetJson;
+
+  has solrcoresadmin => is => 'lazy', default => sub { 
+    my $self = shift;
+    SolrCoresAdmin->new( solrurl => $self->solrurl );
+  };
+  has solrurl => is => 'lazy';
+  has params => is => 'lazy';
+
+  sub _getMBean {
+    my ($self, $core) = @_;
+    return SolrCoreMBean->new({ solrurl => $self->solrurl, core => $core });
+  }
+  sub _cacheConfig {
+    my ($self, $cacheType, $cacheName) = @_;
+    my $core = core_alias($self->params->{'core'});
+    return _format($CACHE_GRAPH_TPL, { core => $core, cacheType => $cacheType, cacheName => $cacheName });
+  }
+
+  sub _format4Value {
+    my ($self, $value) = @_;
+
+    if ($value =~ /\D/) {
+      return "%s";
+    }
+    if ($value =~ /^\d+$/) {
+      return "%d";
+    }
+    if ($value =~ /^[\d\.e]+$/) {
+      return "%.6f";
+    }
+    return "%s";
+  }
+
+  sub _cacheFetch {
+    my ($self, $cacheType, $fields) =  @_;
+    $fields //= ['size', 'lookups', 'hits', 'inserts', 'evictions'];
+    my $hits_fields = ['lookups', 'hits', 'inserts'];
+    my $size_fields = ['size', 'evictions'];
+    my $results = [];
+    my $solrmbean = $self->_getMBean($self->params->{'core'});
+    my $data = $solrmbean->$cacheType;
+    my $core = core_alias($self->params->{'core'});
+    push @{ $results }, _format( 'multigraph solr_{core}_{cacheType}_hit_rates', { core => $core, cacheType => $cacheType });
+
+    for my $label (@{ $hits_fields }) {
+      my $vformat = $self->_format4Value($data->{'label'});
+      push @{ $results }, sprintf("%s.value " . $vformat, ($label, $data->{$label}));
+    }
+    push @{ $results }, _format('multigraph solr_{core}_{cacheType}_size', { core => $core, cacheType => $cacheType });
+
+    for my $label (@{ $size_fields }) {
+      push @{ $results }, sprintf("%s.value %d", ($label, $data->{$label}));
+    }
+    return join "\n", @{ $results };
+  }
+
+  sub config {
+    my ($self, $mtype) = @_;
+    my $mtype_getter = "${mtype}Config";
+    die "Unknown check $mtype" if (!$mtype or !$self->can($mtype_getter));
+        
+      
+    return $self->$mtype_getter;
+  }
+
+  sub fetch {
+    my ($self, $mtype) = @_;
+    my $type = $self->params->{'type'};
+    return $self->$type;
+  }
+
+  sub _getCores {
+    my ($self) = @_;
+    my $cores;
+    if ($self->params->{'core'}) {
+      $cores = [$self->params->{'core'}];
+    } else {
+      $cores = [ sort @{ $self->solrcoresadmin->getCores() } ];
+    }
+    return $cores;
+  }
+  sub qpsConfig {
+    my ($self) = @_;
+    
+    my $cores = core_alias($self->_getCores());
+    my @cores = map {
+      my $name = $_;
+      my $label = $name;
+      $label =~ s/_(.)(?:hard|eplica)/_$1/gmx;
+      +{ name => $name, label => $label };
+    } @{ $cores };
+    my $graph = [ map { _format( $QPSCORE_GRAPH_TPL, { core => $_->{name}, core_label => $_->{label}, handler => $self->params->{'params'}->{'handleralias'}, gtype => 'LINESTACK1' }); } @cores ];
+
+    return _format($QPSMAIN_GRAPH_TPL, {
+        cores_qps_graphs => (join "\n", @{ $graph }), 
+        handler => $self->params->{'params'}->{'handleralias'}, 
+        core => core_alias($self->params->{'core'}), 
+        cores_qps_cdefs => (sprintf '%s,%s', (join(',', map { 'qps_$_' } @{$cores})), join(',', '+' x (scalar(@{ $cores })-1))), 
+        gorder => join(',', @{ $cores }),
+    });
+  }
+
+  sub qps {
+    my ($self) = @_;
+    my $results = [];
+    my $cores = $self->_getCores();
+
+    my $doc = HTTPGetJson(join '/', $self->solrurl, $URIS->{CORE_SELECT});
+    for my $c (@{$cores}) {
+      my $dotted = "solr.core.$c";
+      $dotted =~ s/_(shard|replica)/.$1/gmx;
+      my $core_info = $doc->{metrics}->{$dotted};
+      my $request_count    = $core_info->{'QUERY./select.requestTimes'}->{'5minRate'};
+      my $request_timeouts = $core_info->{'QUERY./select.timeouts'}->{'5minRate'};
+      my $request_errors   = $core_info->{'QUERY./select.errors'}->{'5minRate'};
+      my $c = core_alias($c);
+      push @{ $results }, (
+        (sprintf 'qps_%s_%s.value %.5f',      ($c, $self->params->{'params'}->{'handleralias'}, $request_count)),
+        (sprintf 'timeouts_%s_%s.value %.5f', ($c, $self->params->{'params'}->{'handleralias'}, $request_timeouts)),
+        (sprintf 'errors_%s_%s.value %.5f',   ($c, $self->params->{'params'}->{'handleralias'}, $request_errors)),
+      );
+    }
+    return join("\n", @{ $results });
+  }
+
+  sub requesttimesConfig {
+    my ($self) = @_;
+    my $cores = $self->_getCores();
+    return join("\n", map { _format($REQUESTTIMES_GRAPH_TPL, { core => $_, handler => $self->params->{'params'}->{'handleralias'} }) } @{ core_alias($cores) });
+  }
+
+  sub requesttimes {
+    my ($self) = @_;
+    my $cores = $self->_getCores();
+    my $results = [];
+
+    my $doc = HTTPGetJson(join '/', $self->solrurl, $URIS->{CORE_SELECT});
+    for my $c (@{$cores}) {
+      my $dotted = "solr.core.$c";
+      $dotted =~ s/_(shard|replica)/.$1/gmx;
+      my $c = core_alias($c);
+      push @{ $results }, _format('multigraph solr_requesttimes_{core}_{handler}', { core => $c, handler => $self->params->{'params'}->{'handleralias'} });
+
+      for my $k (qw/mean_ms p75_ms p95_ms/) { 
+        push @{ $results }, (sprintf 's%s_%s.value %.5f', lc($k), $c, $doc->{metrics}->{$dotted}->{'QUERY./select.requestTimes'}->{$k});
+      }
+    }
+    return join("\n", @{ $results });
+  }
+  sub numdocsConfig {
+    my ($self) = @_;
+    return sprintf($NUMDOCS_GRAPH_TPL, core_alias($self->params->{'core'}));
+  }
+
+  sub numdocs {
+    my ($self) = @_;
+    my $mbean = $self->_getMBean($self->params->{'core'});
+
+    return sprintf 'docs.value %d', $mbean->numdocs($self->params->{'params'});
+  }
+  sub indexsizeConfig {
+    my ($self) = @_;
+    my $cores = core_alias($self->_getCores());
+    my @graph = map { _format($INDEXSIZECORE_GRAPH_TPL, {core => $_}) } @{ $cores || [] };
+    return _format($INDEXSIZE_GRAPH_TPL, { cores => join(" ", @{ $cores || [] }), cores_config => join("\n", @graph) });
+  }
+  sub indexsize {
+    my ($self) = @_;
+    my $results = [];
+    my $sizes  = $self->solrcoresadmin->indexsize($self->params->{'params'});
+    for my $c (keys %{ $sizes }) {
+      push @{ $results }, (sprintf "%s.value %d", core_alias($c), $sizes->{$c});
+    }
+    my $cores = $self->_getCores();
+    my $mbean = $self->_getMBean($cores->[0]);
+    my $memory = $mbean->memory();
+    push @{ $results }, (sprintf 'xmx.value %d', $memory->{'max'});
+
+    return join("\n", @{ $results || [] });
+  }
+  
+  sub memoryConfig {
+    my ($self) = @_;
+
+    my $cores = $self->_getCores();
+    my $mbean = $self->_getMBean($cores->[0]);
+    my $memory = $mbean->memory();
+    
+    return _format($MEMORYUSAGE_GRAPH_TPL, { availableram => $memory->{'max'} * 1.05 });
+  }
+
+  sub memory {
+    my ($self) = @_;
+    my $results = [];
+    my $cores = $self->_getCores();
+    my $mbean = $self->_getMBean($cores->[0]);
+    my $memory = $mbean->memory();
+    return join("\n", sprintf('used.value %d', $memory->{'used'}), sprintf('max.value %d', $memory->{'max'}));
+  }
+  
+  sub documentcacheConfig {
+    return shift->_cacheConfig('documentcache', 'Document Cache')
+  }
+  
+  sub documentcache {
+    return shift->_cacheFetch('documentcache')
+  }
+  
+  sub filtercacheConfig {
+    return shift->_cacheConfig('filtercache', 'Filter Cache')
+  }
+  
+  sub filtercache {
+    return shift->_cacheFetch('filtercache')
+  }
+  
+  sub fieldvaluecacheConfig {
+      return shift->_cacheConfig('fieldvaluecache', 'Field Value Cache')
+  }
+  
+  sub fieldvaluecache {
+    return shift->_cacheFetch('fieldvaluecache')
+  }
+  
+  sub queryresultcacheConfig {
+    return shift->_cacheConfig('queryresultcache', 'Query Cache')
+  }
+  
+  sub queryresultcache {
+    return shift->_cacheFetch('queryresultcache')
+  }
+}
+
+package main {
+  my $params = parse_params();
+
+  my $SOLR_URL  = $ENV{SOLR_URL} // 'http://localhost:8081/solr';
+
+  my $mb = SolrMuninGraph->new( { solrurl => $SOLR_URL, params => $params });
+  my $op = $params->{'op'};
+
+  say $mb->$op($params->{'type'}) if $mb->can($params->{'op'});
+}
